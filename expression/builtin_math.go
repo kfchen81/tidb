@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cznic/mathutil"
@@ -965,20 +966,35 @@ func (c *randFunctionClass) getFunction(ctx sessionctx.Context, args []Expressio
 	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, argTps...)
 	bt := bf
 	if len(args) == 0 {
-		sig = &builtinRandSig{bt, nil}
+		seed := time.Now().UnixNano()
+		sig = &builtinRandSig{bt, &sync.Mutex{}, rand.New(rand.NewSource(seed))}
+	} else if _, isConstant := args[0].(*Constant); isConstant {
+		// According to MySQL manual:
+		// If an integer argument N is specified, it is used as the seed value:
+		// With a constant initializer argument, the seed is initialized once
+		// when the statement is prepared, prior to execution.
+		seed, isNull, err := args[0].EvalInt(ctx, chunk.Row{})
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			seed = time.Now().UnixNano()
+		}
+		sig = &builtinRandSig{bt, &sync.Mutex{}, rand.New(rand.NewSource(seed))}
 	} else {
-		sig = &builtinRandWithSeedSig{bt, nil}
+		sig = &builtinRandWithSeedSig{bt}
 	}
 	return sig, nil
 }
 
 type builtinRandSig struct {
 	baseBuiltinFunc
+	mu      *sync.Mutex
 	randGen *rand.Rand
 }
 
 func (b *builtinRandSig) Clone() builtinFunc {
-	newSig := &builtinRandSig{randGen: b.randGen}
+	newSig := &builtinRandSig{randGen: b.randGen, mu: b.mu}
 	newSig.cloneFrom(&b.baseBuiltinFunc)
 	return newSig
 }
@@ -986,19 +1002,18 @@ func (b *builtinRandSig) Clone() builtinFunc {
 // evalReal evals RAND().
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_rand
 func (b *builtinRandSig) evalReal(row chunk.Row) (float64, bool, error) {
-	if b.randGen == nil {
-		b.randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
-	}
-	return b.randGen.Float64(), false, nil
+	b.mu.Lock()
+	res := b.randGen.Float64()
+	b.mu.Unlock()
+	return res, false, nil
 }
 
 type builtinRandWithSeedSig struct {
 	baseBuiltinFunc
-	randGen *rand.Rand
 }
 
 func (b *builtinRandWithSeedSig) Clone() builtinFunc {
-	newSig := &builtinRandWithSeedSig{randGen: b.randGen}
+	newSig := &builtinRandWithSeedSig{}
 	newSig.cloneFrom(&b.baseBuiltinFunc)
 	return newSig
 }
@@ -1010,15 +1025,16 @@ func (b *builtinRandWithSeedSig) evalReal(row chunk.Row) (float64, bool, error) 
 	if err != nil {
 		return 0, true, err
 	}
-	if b.randGen == nil {
-		if isNull {
-			// When seed is NULL, it is equal to RAND().
-			b.randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
-		} else {
-			b.randGen = rand.New(rand.NewSource(seed))
-		}
+	// b.args[0] is promised to be a non-constant(such as a column name) in
+	// builtinRandWithSeedSig, the seed is initialized with the value for each
+	// invocation of RAND().
+	var randGen *rand.Rand
+	if isNull {
+		randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
+	} else {
+		randGen = rand.New(rand.NewSource(seed))
 	}
-	return b.randGen.Float64(), false, nil
+	return randGen.Float64(), false, nil
 }
 
 type powFunctionClass struct {
@@ -1573,7 +1589,7 @@ func (b *builtinExpSig) evalReal(row chunk.Row) (float64, bool, error) {
 	}
 	exp := math.Exp(val)
 	if math.IsInf(exp, 0) || math.IsNaN(exp) {
-		s := fmt.Sprintf("exp(%s)", strconv.FormatFloat(val, 'f', -1, 64))
+		s := fmt.Sprintf("exp(%s)", b.args[0].String())
 		return 0, false, types.ErrOverflow.GenWithStackByArgs("DOUBLE", s)
 	}
 	return exp, false, nil

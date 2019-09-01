@@ -16,8 +16,8 @@ package mocktikv
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"sort"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -30,7 +30,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var (
@@ -41,6 +41,20 @@ var (
 	_ executor = &topNExec{}
 )
 
+type execDetail struct {
+	timeProcessed   time.Duration
+	numProducedRows int
+	numIterations   int
+}
+
+func (e *execDetail) update(begin time.Time, row [][]byte) {
+	e.timeProcessed += time.Since(begin)
+	e.numIterations++
+	if row != nil {
+		e.numProducedRows++
+	}
+}
+
 type executor interface {
 	SetSrcExec(executor)
 	GetSrcExec() executor
@@ -49,6 +63,9 @@ type executor interface {
 	Next(ctx context.Context) ([][]byte, error)
 	// Cursor returns the key gonna to be scanned by the Next() function.
 	Cursor() (key []byte, desc bool)
+	// ExecDetails returns its and its children's execution details.
+	// The order is same as DAGRequest.Executors, which children are in front of parents.
+	ExecDetails() []*execDetail
 }
 
 type tableScanExec struct {
@@ -62,8 +79,17 @@ type tableScanExec struct {
 	seekKey        []byte
 	start          int
 	counts         []int64
+	execDetail     *execDetail
 
 	src executor
+}
+
+func (e *tableScanExec) ExecDetails() []*execDetail {
+	var suffix []*execDetail
+	if e.src != nil {
+		suffix = e.src.ExecDetails()
+	}
+	return append(suffix, e.execDetail)
 }
 
 func (e *tableScanExec) SetSrcExec(exec executor) {
@@ -115,6 +141,9 @@ func (e *tableScanExec) Cursor() ([]byte, bool) {
 }
 
 func (e *tableScanExec) Next(ctx context.Context) (value [][]byte, err error) {
+	defer func(begin time.Time) {
+		e.execDetail.update(begin, value)
+	}(time.Now())
 	for e.cursor < len(e.kvRanges) {
 		ran := e.kvRanges[e.cursor]
 		if ran.IsPoint() {
@@ -216,12 +245,6 @@ func (e *tableScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 	return row, nil
 }
 
-const (
-	pkColNotExists = iota
-	pkColIsSigned
-	pkColIsUnsigned
-)
-
 type indexScanExec struct {
 	*tipb.IndexScan
 	colsLen        int
@@ -231,11 +254,20 @@ type indexScanExec struct {
 	mvccStore      MVCCStore
 	cursor         int
 	seekKey        []byte
-	pkStatus       int
+	pkStatus       tablecodec.PrimaryKeyStatus
 	start          int
 	counts         []int64
+	execDetail     *execDetail
 
 	src executor
+}
+
+func (e *indexScanExec) ExecDetails() []*execDetail {
+	var suffix []*execDetail
+	if e.src != nil {
+		suffix = e.src.ExecDetails()
+	}
+	return append(suffix, e.execDetail)
 }
 
 func (e *indexScanExec) SetSrcExec(exec executor) {
@@ -288,6 +320,9 @@ func (e *indexScanExec) Cursor() ([]byte, bool) {
 }
 
 func (e *indexScanExec) Next(ctx context.Context) (value [][]byte, err error) {
+	defer func(begin time.Time) {
+		e.execDetail.update(begin, value)
+	}(time.Now())
 	for e.cursor < len(e.kvRanges) {
 		ran := e.kvRanges[e.cursor]
 		if ran.IsPoint() && e.isUnique() {
@@ -331,37 +366,7 @@ func (e *indexScanExec) getRowFromPoint(ran kv.KeyRange) ([][]byte, error) {
 	if len(val) == 0 {
 		return nil, nil
 	}
-	return e.decodeIndexKV(Pair{Key: ran.StartKey, Value: val})
-}
-
-func (e *indexScanExec) decodeIndexKV(pair Pair) ([][]byte, error) {
-	values, b, err := tablecodec.CutIndexKeyNew(pair.Key, e.colsLen)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if len(b) > 0 {
-		if e.pkStatus != pkColNotExists {
-			values = append(values, b)
-		}
-	} else if e.pkStatus != pkColNotExists {
-		handle, err := decodeHandle(pair.Value)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		var handleDatum types.Datum
-		if e.pkStatus == pkColIsUnsigned {
-			handleDatum = types.NewUintDatum(uint64(handle))
-		} else {
-			handleDatum = types.NewIntDatum(handle)
-		}
-		handleBytes, err := codec.EncodeValue(nil, b, handleDatum)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		values = append(values, handleBytes)
-	}
-
-	return values, nil
+	return tablecodec.DecodeIndexKV(ran.StartKey, val, e.colsLen, e.pkStatus)
 }
 
 func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
@@ -401,7 +406,7 @@ func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 		e.seekKey = []byte(kv.Key(pair.Key).PrefixNext())
 	}
 
-	return e.decodeIndexKV(pair)
+	return tablecodec.DecodeIndexKV(pair.Key, pair.Value, e.colsLen, e.pkStatus)
 }
 
 type selectionExec struct {
@@ -410,6 +415,15 @@ type selectionExec struct {
 	row               []types.Datum
 	evalCtx           *evalContext
 	src               executor
+	execDetail        *execDetail
+}
+
+func (e *selectionExec) ExecDetails() []*execDetail {
+	var suffix []*execDetail
+	if e.src != nil {
+		suffix = e.src.ExecDetails()
+	}
+	return append(suffix, e.execDetail)
 }
 
 func (e *selectionExec) SetSrcExec(exec executor) {
@@ -455,6 +469,9 @@ func (e *selectionExec) Cursor() ([]byte, bool) {
 }
 
 func (e *selectionExec) Next(ctx context.Context) (value [][]byte, err error) {
+	defer func(begin time.Time) {
+		e.execDetail.update(begin, value)
+	}(time.Now())
 	for {
 		value, err = e.src.Next(ctx)
 		if err != nil {
@@ -486,8 +503,17 @@ type topNExec struct {
 	row               []types.Datum
 	cursor            int
 	executed          bool
+	execDetail        *execDetail
 
 	src executor
+}
+
+func (e *topNExec) ExecDetails() []*execDetail {
+	var suffix []*execDetail
+	if e.src != nil {
+		suffix = e.src.ExecDetails()
+	}
+	return append(suffix, e.execDetail)
 }
 
 func (e *topNExec) SetSrcExec(src executor) {
@@ -526,6 +552,9 @@ func (e *topNExec) Cursor() ([]byte, bool) {
 }
 
 func (e *topNExec) Next(ctx context.Context) (value [][]byte, err error) {
+	defer func(begin time.Time) {
+		e.execDetail.update(begin, value)
+	}(time.Now())
 	if !e.executed {
 		for {
 			hasMore, err := e.innerNext(ctx)
@@ -576,6 +605,16 @@ type limitExec struct {
 	cursor uint64
 
 	src executor
+
+	execDetail *execDetail
+}
+
+func (e *limitExec) ExecDetails() []*execDetail {
+	var suffix []*execDetail
+	if e.src != nil {
+		suffix = e.src.ExecDetails()
+	}
+	return append(suffix, e.execDetail)
 }
 
 func (e *limitExec) SetSrcExec(src executor) {
@@ -599,6 +638,9 @@ func (e *limitExec) Cursor() ([]byte, bool) {
 }
 
 func (e *limitExec) Next(ctx context.Context) (value [][]byte, err error) {
+	defer func(begin time.Time) {
+		e.execDetail.update(begin, value)
+	}(time.Now())
 	if e.cursor >= e.limit {
 		return nil, nil
 	}
@@ -677,11 +719,4 @@ func convertToExprs(sc *stmtctx.StatementContext, fieldTps []*types.FieldType, p
 		exprs = append(exprs, e)
 	}
 	return exprs, nil
-}
-
-func decodeHandle(data []byte) (int64, error) {
-	var h int64
-	buf := bytes.NewBuffer(data)
-	err := binary.Read(buf, binary.BigEndian, &h)
-	return h, errors.Trace(err)
 }

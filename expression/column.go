@@ -40,6 +40,41 @@ func (col *CorrelatedColumn) Clone() Expression {
 	return col
 }
 
+// VecEvalInt evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalInt(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETInt, input, result)
+}
+
+// VecEvalReal evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalReal(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETReal, input, result)
+}
+
+// VecEvalString evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalString(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETString, input, result)
+}
+
+// VecEvalDecimal evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalDecimal(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETDecimal, input, result)
+}
+
+// VecEvalTime evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalTime(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETTimestamp, input, result)
+}
+
+// VecEvalDuration evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalDuration(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETDuration, input, result)
+}
+
+// VecEvalJSON evaluates this expression in a vectorized manner.
+func (col *CorrelatedColumn) VecEvalJSON(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	return genVecFromConstExpr(ctx, col, types.ETJson, input, result)
+}
+
 // Eval implements Expression interface.
 func (col *CorrelatedColumn) Eval(row chunk.Row) (types.Datum, error) {
 	return *col.Data, nil
@@ -123,6 +158,11 @@ func (col *CorrelatedColumn) IsCorrelated() bool {
 	return true
 }
 
+// ConstItem implements Expression interface.
+func (col *CorrelatedColumn) ConstItem() bool {
+	return false
+}
+
 // Decorrelate implements Expression interface.
 func (col *CorrelatedColumn) Decorrelate(schema *Schema) Expression {
 	if !schema.Contains(&col.Column) {
@@ -153,15 +193,19 @@ type Column struct {
 	ID int64
 	// UniqueID is the unique id of this column.
 	UniqueID int64
-	// IsReferenced means if this column is referenced to an Aggregation column, or a Subquery column,
-	// or an argument column of function IfNull.
-	// If so, this column's name will be the plain sql text.
-	IsReferenced bool
 
 	// Index is used for execution, to tell the column's position in the given row.
 	Index int
 
 	hashcode []byte
+
+	// IsReferenced means if this column is referenced to an Aggregation column, or a Subquery column,
+	// or an argument column of function IfNull.
+	// If so, this column's name will be the plain sql text.
+	IsReferenced bool
+	// InOperand indicates whether this column is the inner operand of column equal condition converted
+	// from `[not] in (subq)`.
+	InOperand bool
 }
 
 // Equal implements Expression interface.
@@ -170,6 +214,80 @@ func (col *Column) Equal(_ sessionctx.Context, expr Expression) bool {
 		return newCol.UniqueID == col.UniqueID
 	}
 	return false
+}
+
+// VecEvalInt evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalInt(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	if col.RetType.Hybrid() {
+		it := chunk.NewIterator4Chunk(input)
+		result.Reset()
+		for row := it.Begin(); row != it.End(); row = it.Next() {
+			v, null, err := col.EvalInt(ctx, row)
+			if err != nil {
+				return err
+			}
+			if null {
+				result.AppendNull()
+			} else {
+				result.AppendInt64(v)
+			}
+		}
+		return nil
+	}
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalReal evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalReal(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalString evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalString(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	if col.RetType.Hybrid() {
+		it := chunk.NewIterator4Chunk(input)
+		result.ReserveString(input.NumRows())
+		for row := it.Begin(); row != it.End(); row = it.Next() {
+			v, null, err := col.EvalString(ctx, row)
+			if err != nil {
+				return err
+			}
+			if null {
+				result.AppendNull()
+			} else {
+				result.AppendString(v)
+			}
+		}
+		return nil
+	}
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalDecimal evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalDecimal(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalTime evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalTime(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalDuration evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalDuration(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
+}
+
+// VecEvalJSON evaluates this expression in a vectorized manner.
+func (col *Column) VecEvalJSON(ctx sessionctx.Context, input *chunk.Chunk, result *chunk.Column) error {
+	input.Column(col.Index).CopyReconstruct(input.Sel(), result)
+	return nil
 }
 
 // String implements Stringer interface.
@@ -231,18 +349,14 @@ func (col *Column) EvalString(ctx sessionctx.Context, row chunk.Row) (string, bo
 	if row.IsNull(col.Index) {
 		return "", true, nil
 	}
+
+	// Specially handle the ENUM/SET/BIT input value.
 	if col.GetType().Hybrid() {
 		val := row.GetDatum(col.Index, col.RetType)
-		if val.IsNull() {
-			return "", true, nil
-		}
 		res, err := val.ToString()
-		resLen := len([]rune(res))
-		if ctx.GetSessionVars().StmtCtx.PadCharToFullLength && col.GetType().Tp == mysql.TypeString && resLen < col.RetType.Flen {
-			res = res + strings.Repeat(" ", col.RetType.Flen-resLen)
-		}
 		return res, err != nil, err
 	}
+
 	val := row.GetString(col.Index)
 	if ctx.GetSessionVars().StmtCtx.PadCharToFullLength && col.GetType().Tp == mysql.TypeString {
 		valLen := len([]rune(val))
@@ -297,6 +411,11 @@ func (col *Column) IsCorrelated() bool {
 	return false
 }
 
+// ConstItem implements Expression interface.
+func (col *Column) ConstItem() bool {
+	return false
+}
+
 // Decorrelate implements Expression interface.
 func (col *Column) Decorrelate(_ *Schema) Expression {
 	return col
@@ -326,6 +445,11 @@ func (col *Column) resolveIndices(schema *Schema) error {
 		return errors.Errorf("Can't find column %s in schema %s", col, schema)
 	}
 	return nil
+}
+
+// Vectorized returns if this expression supports vectorized evaluation.
+func (col *Column) Vectorized() bool {
+	return true
 }
 
 // Column2Exprs will transfer column slice to expression slice.

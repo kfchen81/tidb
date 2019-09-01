@@ -16,14 +16,15 @@ package executor
 import (
 	"context"
 	"sort"
-	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/set"
 )
 
 // DirtyDB stores uncommitted write operations for a transaction.
@@ -33,37 +34,13 @@ type DirtyDB struct {
 	tables map[int64]*DirtyTable
 }
 
-// AddRow adds a row to the DirtyDB.
-func (udb *DirtyDB) AddRow(tid, handle int64, row []types.Datum) {
-	dt := udb.GetDirtyTable(tid)
-	for i := range row {
-		if row[i].Kind() == types.KindString {
-			row[i].SetBytes(row[i].GetBytes())
-		}
-	}
-	dt.addedRows[handle] = row
-}
-
-// DeleteRow deletes a row from the DirtyDB.
-func (udb *DirtyDB) DeleteRow(tid int64, handle int64) {
-	dt := udb.GetDirtyTable(tid)
-	delete(dt.addedRows, handle)
-	dt.deletedRows[handle] = struct{}{}
-}
-
-// TruncateTable truncates a table.
-func (udb *DirtyDB) TruncateTable(tid int64) {
-	dt := udb.GetDirtyTable(tid)
-	dt.addedRows = make(map[int64][]types.Datum)
-	dt.truncated = true
-}
-
 // GetDirtyTable gets the DirtyTable by id from the DirtyDB.
 func (udb *DirtyDB) GetDirtyTable(tid int64) *DirtyTable {
 	dt, ok := udb.tables[tid]
 	if !ok {
 		dt = &DirtyTable{
-			addedRows:   make(map[int64][]types.Datum),
+			tid:         tid,
+			addedRows:   make(map[int64]struct{}),
 			deletedRows: make(map[int64]struct{}),
 		}
 		udb.tables[tid] = dt
@@ -73,11 +50,29 @@ func (udb *DirtyDB) GetDirtyTable(tid int64) *DirtyTable {
 
 // DirtyTable stores uncommitted write operation for a transaction.
 type DirtyTable struct {
+	tid int64
 	// addedRows ...
 	// the key is handle.
-	addedRows   map[int64][]types.Datum
+	addedRows   map[int64]struct{}
 	deletedRows map[int64]struct{}
 	truncated   bool
+}
+
+// AddRow adds a row to the DirtyDB.
+func (dt *DirtyTable) AddRow(handle int64, row []types.Datum) {
+	dt.addedRows[handle] = struct{}{}
+}
+
+// DeleteRow deletes a row from the DirtyDB.
+func (dt *DirtyTable) DeleteRow(handle int64) {
+	delete(dt.addedRows, handle)
+	dt.deletedRows[handle] = struct{}{}
+}
+
+// TruncateTable truncates a table.
+func (dt *DirtyTable) TruncateTable() {
+	dt.addedRows = make(map[int64]struct{})
+	dt.truncated = true
 }
 
 // GetDirtyDB returns the DirtyDB bind to the context.
@@ -103,39 +98,58 @@ type UnionScanExec struct {
 	desc       bool
 	conditions []expression.Expression
 	columns    []*model.ColumnInfo
-
+	table      table.Table
 	// belowHandleIndex is the handle's position of the below scan plan.
 	belowHandleIndex int
 
-	addedRows           [][]types.Datum
+	addedRows [][]types.Datum
+	// memIdxHandles is uses to store the handle ids that has been read by memIndexReader.
+	memIdxHandles       set.Int64Set
 	cursor4AddRows      int
 	sortErr             error
 	snapshotRows        [][]types.Datum
 	cursor4SnapshotRows int
 	snapshotChunkBuffer *chunk.Chunk
+	mutableRow          chunk.MutRow
 }
 
 // Open implements the Executor Open interface.
 func (us *UnionScanExec) Open(ctx context.Context) error {
 	if err := us.baseExecutor.Open(ctx); err != nil {
-		return errors.Trace(err)
+		return err
 	}
-	us.snapshotChunkBuffer = us.newFirstChunk()
+	return us.open(ctx)
+}
+
+func (us *UnionScanExec) open(ctx context.Context) error {
+	var err error
+	reader := us.children[0]
+	switch x := reader.(type) {
+	case *TableReaderExecutor:
+		us.addedRows, err = buildMemTableReader(us, x).getMemRows()
+	case *IndexReaderExecutor:
+		mIdxReader := buildMemIndexReader(us, x)
+		us.addedRows, err = mIdxReader.getMemRows()
+		us.memIdxHandles = mIdxReader.memIdxHandles
+	case *IndexLookUpExecutor:
+		us.memIdxHandles = set.NewInt64Set()
+		err = us.buildAndSortAddedRows(ctx, x.table)
+	}
+	if err != nil {
+		return err
+	}
+	us.snapshotChunkBuffer = newFirstChunk(us)
 	return nil
 }
 
 // Next implements the Executor Next interface.
-func (us *UnionScanExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
-	if us.runtimeStats != nil {
-		start := time.Now()
-		defer func() { us.runtimeStats.Record(time.Since(start), req.NumRows()) }()
-	}
+func (us *UnionScanExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.GrowAndReset(us.maxChunkSize)
-	mutableRow := chunk.MutRowFromTypes(us.retTypes())
+	mutableRow := chunk.MutRowFromTypes(retTypes(us))
 	for i, batchSize := 0, req.Capacity(); i < batchSize; i++ {
 		row, err := us.getOneRow(ctx)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 		// no more data.
 		if row == nil {
@@ -152,7 +166,7 @@ func (us *UnionScanExec) getOneRow(ctx context.Context) ([]types.Datum, error) {
 	for {
 		snapshotRow, err := us.getSnapshotRow(ctx)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		addedRow := us.getAddedRow()
 		var row []types.Datum
@@ -165,7 +179,7 @@ func (us *UnionScanExec) getOneRow(ctx context.Context) ([]types.Datum, error) {
 		} else {
 			isSnapshotRow, err = us.shouldPickFirstRow(snapshotRow, addedRow)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, err
 			}
 			if isSnapshotRow {
 				row = snapshotRow
@@ -197,25 +211,57 @@ func (us *UnionScanExec) getSnapshotRow(ctx context.Context) ([]types.Datum, err
 	us.cursor4SnapshotRows = 0
 	us.snapshotRows = us.snapshotRows[:0]
 	for len(us.snapshotRows) == 0 {
-		err = us.children[0].Next(ctx, chunk.NewRecordBatch(us.snapshotChunkBuffer))
+		err = Next(ctx, us.children[0], us.snapshotChunkBuffer)
 		if err != nil || us.snapshotChunkBuffer.NumRows() == 0 {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		iter := chunk.NewIterator4Chunk(us.snapshotChunkBuffer)
 		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
 			snapshotHandle := row.GetInt64(us.belowHandleIndex)
 			if _, ok := us.dirty.deletedRows[snapshotHandle]; ok {
+				err = us.getMissIndexRowsByHandle(ctx, snapshotHandle)
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			if _, ok := us.dirty.addedRows[snapshotHandle]; ok {
 				// If src handle appears in added rows, it means there is conflict and the transaction will fail to
 				// commit, but for simplicity, we don't handle it here.
+				err = us.getMissIndexRowsByHandle(ctx, snapshotHandle)
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
-			us.snapshotRows = append(us.snapshotRows, row.GetDatumRow(us.children[0].retTypes()))
+			us.snapshotRows = append(us.snapshotRows, row.GetDatumRow(retTypes(us.children[0])))
 		}
 	}
 	return us.snapshotRows[0], nil
+}
+
+// For index reader and index look up reader, update doesn't write index to txn memBuffer when the idx column
+// is unchanged. So the `memIndexReader` and `memIndexLookUpReader` can't read the index from txn memBuffer.
+// This function is used to get the missing row by the handle if the handle is in dirtyTable.addedRows.
+func (us *UnionScanExec) getMissIndexRowsByHandle(ctx context.Context, handle int64) error {
+	reader := us.children[0]
+	switch reader.(type) {
+	case *TableReaderExecutor:
+		return nil
+	}
+	if _, ok := us.dirty.addedRows[handle]; !ok {
+		return nil
+	}
+	// Don't miss in memBuffer reader.
+	if us.memIdxHandles.Exist(handle) {
+		return nil
+	}
+	memRow, err := us.getMemRow(ctx, handle)
+	if memRow == nil || err != nil {
+		return err
+	}
+	us.snapshotRows = append(us.snapshotRows, memRow)
+	return nil
 }
 
 func (us *UnionScanExec) getAddedRow() []types.Datum {
@@ -232,7 +278,7 @@ func (us *UnionScanExec) shouldPickFirstRow(a, b []types.Datum) (bool, error) {
 	var isFirstRow bool
 	addedCmpSrc, err := us.compare(a, b)
 	if err != nil {
-		return isFirstRow, errors.Trace(err)
+		return isFirstRow, err
 	}
 	// Compare result will never be 0.
 	if us.desc {
@@ -254,7 +300,7 @@ func (us *UnionScanExec) compare(a, b []types.Datum) (int, error) {
 		bColumn := b[colOff]
 		cmp, err := aColumn.CompareDatum(sc, &bColumn)
 		if err != nil {
-			return 0, errors.Trace(err)
+			return 0, err
 		}
 		if cmp != 0 {
 			return cmp, nil
@@ -273,22 +319,54 @@ func (us *UnionScanExec) compare(a, b []types.Datum) (int, error) {
 	return cmp, nil
 }
 
-func (us *UnionScanExec) buildAndSortAddedRows() error {
+// rowWithColsInTxn gets the row from the transaction buffer.
+func (us *UnionScanExec) rowWithColsInTxn(ctx context.Context, t table.Table, h int64) ([]types.Datum, error) {
+	key := t.RecordKey(h)
+	txn, err := us.ctx.Txn(true)
+	if err != nil {
+		return nil, err
+	}
+	value, err := txn.GetMemBuffer().Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	colIDs := make(map[int64]int)
+	for i, col := range us.columns {
+		colIDs[col.ID] = i
+	}
+	return decodeRowData(us.ctx, us.table.Meta(), us.columns, colIDs, h, []byte{}, value)
+}
+
+func (us *UnionScanExec) getMemRow(ctx context.Context, h int64) ([]types.Datum, error) {
+	data, err := us.rowWithColsInTxn(ctx, us.table, h)
+	if err != nil {
+		return nil, err
+	}
+	us.mutableRow.SetDatums(data...)
+	matched, _, err := expression.EvalBool(us.ctx, us.conditions, us.mutableRow.ToRow())
+	if err != nil {
+		return nil, err
+	}
+	if !matched {
+		return nil, nil
+	}
+	return data, nil
+}
+
+// TODO: remove `buildAndSortAddedRows` functions and `DirtyTable`.
+func (us *UnionScanExec) buildAndSortAddedRows(ctx context.Context, t table.Table) error {
 	us.addedRows = make([][]types.Datum, 0, len(us.dirty.addedRows))
-	mutableRow := chunk.MutRowFromTypes(us.retTypes())
-	for h, data := range us.dirty.addedRows {
-		newData := make([]types.Datum, 0, us.schema.Len())
-		for _, col := range us.columns {
-			if col.ID == model.ExtraHandleID {
-				newData = append(newData, types.NewIntDatum(h))
-			} else {
-				newData = append(newData, data[col.Offset])
-			}
+	mutableRow := chunk.MutRowFromTypes(retTypes(us))
+	for h := range us.dirty.addedRows {
+		us.memIdxHandles.Insert(h)
+		newData, err := us.rowWithColsInTxn(ctx, t, h)
+		if err != nil {
+			return err
 		}
 		mutableRow.SetDatums(newData...)
-		matched, err := expression.EvalBool(us.ctx, us.conditions, mutableRow.ToRow())
+		matched, _, err := expression.EvalBool(us.ctx, us.conditions, mutableRow.ToRow())
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 		if !matched {
 			continue

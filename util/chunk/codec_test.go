@@ -21,7 +21,6 @@ import (
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
-	"github.com/pingcap/tidb/util/hack"
 )
 
 var _ = check.Suite(&testCodecSuite{})
@@ -74,7 +73,7 @@ func (s *testCodecSuite) TestCodec(c *check.C) {
 		c.Assert(row.GetString(2), check.Equals, str)
 		c.Assert(row.GetString(3), check.Equals, str)
 		c.Assert(row.GetMyDecimal(4).String(), check.Equals, str)
-		c.Assert(hack.String(row.GetJSON(5).GetString()), check.Equals, str)
+		c.Assert(string(row.GetJSON(5).GetString()), check.Equals, str)
 	}
 }
 
@@ -82,11 +81,10 @@ func BenchmarkEncodeChunk(b *testing.B) {
 	numCols := 4
 	numRows := 1024
 
-	chk := &Chunk{columns: make([]*column, numCols)}
+	chk := &Chunk{columns: make([]*Column, numCols)}
 	for i := 0; i < numCols; i++ {
-		chk.columns[i] = &column{
+		chk.columns[i] = &Column{
 			length:     numRows,
-			nullCount:  14,
 			nullBitmap: make([]byte, numRows/8+1),
 			data:       make([]byte, numRows*8),
 		}
@@ -105,11 +103,10 @@ func BenchmarkDecode(b *testing.B) {
 	numRows := 1024
 
 	colTypes := make([]*types.FieldType, numCols)
-	chk := &Chunk{columns: make([]*column, numCols)}
+	chk := &Chunk{columns: make([]*Column, numCols)}
 	for i := 0; i < numCols; i++ {
-		chk.columns[i] = &column{
+		chk.columns[i] = &Column{
 			length:     numRows,
-			nullCount:  14,
 			nullBitmap: make([]byte, numRows/8+1),
 			data:       make([]byte, numRows*8),
 		}
@@ -132,12 +129,11 @@ func BenchmarkDecodeToChunk(b *testing.B) {
 
 	colTypes := make([]*types.FieldType, numCols)
 	chk := &Chunk{
-		columns: make([]*column, numCols),
+		columns: make([]*Column, numCols),
 	}
 	for i := 0; i < numCols; i++ {
-		chk.columns[i] = &column{
+		chk.columns[i] = &Column{
 			length:     numRows,
-			nullCount:  14,
 			nullBitmap: make([]byte, numRows/8+1),
 			data:       make([]byte, numRows*8),
 			elemBuf:    make([]byte, 8),

@@ -82,6 +82,8 @@ type PhysicalIndexLookUpReader struct {
 	TablePlans []PhysicalPlan
 	indexPlan  PhysicalPlan
 	tablePlan  PhysicalPlan
+
+	ExtraHandleCol *expression.Column
 }
 
 // PhysicalIndexScan represents an index scan plan.
@@ -90,7 +92,6 @@ type PhysicalIndexScan struct {
 
 	// AccessCondition is used to calculate range.
 	AccessCondition []expression.Expression
-	filterCondition []expression.Expression
 
 	Table      *model.TableInfo
 	Index      *model.IndexInfo
@@ -99,11 +100,6 @@ type PhysicalIndexScan struct {
 	Ranges     []*ranger.Range
 	Columns    []*model.ColumnInfo
 	DBName     model.CIStr
-	Desc       bool
-	KeepOrder  bool
-	// DoubleRead means if the index executor will read kv two times.
-	// If the query requires the columns that don't belong to index, DoubleRead will be true.
-	DoubleRead bool
 
 	TableAsName *model.CIStr
 
@@ -115,11 +111,19 @@ type PhysicalIndexScan struct {
 	// It is used for query feedback.
 	Hist *statistics.Histogram
 
-	rangeDecidedBy []*expression.Column
+	rangeInfo string
 
 	// The index scan may be on a partition.
-	isPartition     bool
 	physicalTableID int64
+
+	GenExprs map[model.TableColumnID]expression.Expression
+
+	isPartition bool
+	Desc        bool
+	KeepOrder   bool
+	// DoubleRead means if the index executor will read kv two times.
+	// If the query requires the columns that don't belong to index, DoubleRead will be true.
+	DoubleRead bool
 }
 
 // PhysicalMemTable reads memory table.
@@ -143,24 +147,27 @@ type PhysicalTableScan struct {
 	Table   *model.TableInfo
 	Columns []*model.ColumnInfo
 	DBName  model.CIStr
-	Desc    bool
 	Ranges  []*ranger.Range
 	pkCol   *expression.Column
 
 	TableAsName *model.CIStr
 
-	// KeepOrder is true, if sort data by scanning pkcol,
-	KeepOrder bool
-
 	// Hist is the histogram when the query was issued.
 	// It is used for query feedback.
 	Hist *statistics.Histogram
 
-	// The table scan may be a partition, rather than a real table.
-	isPartition     bool
 	physicalTableID int64
 
 	rangeDecidedBy []*expression.Column
+
+	// HandleIdx is the index of handle, which is only used for admin check table.
+	HandleIdx int
+
+	// The table scan may be a partition, rather than a real table.
+	isPartition bool
+	// KeepOrder is true, if sort data by scanning pkcol,
+	KeepOrder bool
+	Desc      bool
 }
 
 // IsPartition returns true and partition ID if it's actually a partition.
@@ -188,11 +195,9 @@ type PhysicalTopN struct {
 
 // PhysicalApply represents apply plan, only used for subquery.
 type PhysicalApply struct {
-	physicalSchemaProducer
+	PhysicalHashJoin
 
-	PhysicalJoin *PhysicalHashJoin
-	OuterSchema  []*expression.CorrelatedColumn
-
+	OuterSchema   []*expression.CorrelatedColumn
 	rightChOffset int
 }
 
@@ -206,6 +211,10 @@ type PhysicalHashJoin struct {
 	LeftConditions  []expression.Expression
 	RightConditions []expression.Expression
 	OtherConditions []expression.Expression
+
+	LeftJoinKeys  []*expression.Column
+	RightJoinKeys []*expression.Column
+
 	// InnerChildIdx indicates which child is to build the hash table.
 	// For inner join, the smaller one will be chosen.
 	// For outer join or semi join, it's exactly the inner one.
@@ -227,7 +236,7 @@ type PhysicalIndexJoin struct {
 	OtherConditions expression.CNFExprs
 	OuterIndex      int
 	outerSchema     *expression.Schema
-	innerPlan       PhysicalPlan
+	innerTask       task
 
 	DefaultValues []types.Datum
 
@@ -235,6 +244,14 @@ type PhysicalIndexJoin struct {
 	Ranges []*ranger.Range
 	// KeyOff2IdxOff maps the offsets in join key to the offsets in the index.
 	KeyOff2IdxOff []int
+	// IdxColLens stores the length of each index column.
+	IdxColLens []int
+	// CompareFilters stores the filters for last column if those filters need to be evaluated during execution.
+	// e.g. select * from t where t.a = t1.a and t.b > t1.b and t.b < t1.b+10
+	//      If there's index(t.a, t.b). All the filters can be used to construct index range but t.b > t1.b and t.b < t1.b=10
+	//      need to be evaluated after we fetch the data of t1.
+	// This struct stores them and evaluate them to ranges.
+	CompareFilters *ColWithCmpFuncManager
 }
 
 // PhysicalMergeJoin represents merge join for inner/ outer join.
@@ -243,6 +260,7 @@ type PhysicalMergeJoin struct {
 
 	JoinType JoinType
 
+	CompareFuncs    []expression.CompareFunc
 	LeftConditions  []expression.Expression
 	RightConditions []expression.Expression
 	OtherConditions []expression.Expression
@@ -258,6 +276,8 @@ type PhysicalLock struct {
 	basePhysicalPlan
 
 	Lock ast.SelectLockType
+
+	TblID2Handle map[int64][]*expression.Column
 }
 
 // PhysicalLimit is the physical operator of Limit.
@@ -271,6 +291,17 @@ type PhysicalLimit struct {
 // PhysicalUnionAll is the physical operator of UnionAll.
 type PhysicalUnionAll struct {
 	physicalSchemaProducer
+	// IsPointGetUnion indicates all the children are PointGet and
+	// all of them reference the same table and use the same `unique key`
+	IsPointGetUnion bool
+}
+
+// OutputNames returns the outputting names of each column.
+func (p *PhysicalUnionAll) OutputNames() []*types.FieldName {
+	if p.IsPointGetUnion {
+		return p.children[0].OutputNames()
+	}
+	return p.physicalSchemaProducer.OutputNames()
 }
 
 // AggregationType stands for the mode of aggregation plan.
@@ -305,13 +336,13 @@ type basePhysicalAgg struct {
 	GroupByItems []expression.Expression
 }
 
-func (p *basePhysicalAgg) hasDistinctFunc() bool {
+func (p *basePhysicalAgg) numDistinctFunc() (num int) {
 	for _, fun := range p.AggFuncs {
 		if fun.HasDistinct {
-			return true
+			num++
 		}
 	}
-	return false
+	return
 }
 
 // PhysicalHashAgg is hash operator of aggregate.
@@ -342,6 +373,8 @@ type PhysicalUnionScan struct {
 	basePhysicalPlan
 
 	Conditions []expression.Expression
+
+	HandleCol *expression.Column
 }
 
 // IsPartition returns true and partition ID if it works on a partition.
@@ -374,13 +407,50 @@ type PhysicalTableDual struct {
 	physicalSchemaProducer
 
 	RowCount int
+	// placeHolder indicates if this dual plan is a place holder in query optimization
+	// for data sources like `Show`, if true, the dual plan would be substituted by
+	// `Show` in the final plan.
+	placeHolder bool
+
+	// names is used for OutputNames() method. Dual may be inited when building point get plan.
+	// So it needs to hold names for itself.
+	names []*types.FieldName
+}
+
+// OutputNames returns the outputting names of each column.
+func (p *PhysicalTableDual) OutputNames() []*types.FieldName {
+	return p.names
 }
 
 // PhysicalWindow is the physical operator of window function.
 type PhysicalWindow struct {
 	physicalSchemaProducer
 
-	WindowFuncDesc *aggregation.WindowFuncDesc
-	PartitionBy    []property.Item
-	OrderBy        []property.Item
+	WindowFuncDescs []*aggregation.WindowFuncDesc
+	PartitionBy     []property.Item
+	OrderBy         []property.Item
+	Frame           *WindowFrame
+}
+
+// CollectPlanStatsVersion uses to collect the statistics version of the plan.
+func CollectPlanStatsVersion(plan PhysicalPlan, statsInfos map[string]uint64) map[string]uint64 {
+	for _, child := range plan.Children() {
+		statsInfos = CollectPlanStatsVersion(child, statsInfos)
+	}
+	switch copPlan := plan.(type) {
+	case *PhysicalTableReader:
+		statsInfos = CollectPlanStatsVersion(copPlan.tablePlan, statsInfos)
+	case *PhysicalIndexReader:
+		statsInfos = CollectPlanStatsVersion(copPlan.indexPlan, statsInfos)
+	case *PhysicalIndexLookUpReader:
+		// For index loop up, only the indexPlan is necessary,
+		// because they use the same stats and we do not set the stats info for tablePlan.
+		statsInfos = CollectPlanStatsVersion(copPlan.indexPlan, statsInfos)
+	case *PhysicalIndexScan:
+		statsInfos[copPlan.Table.Name.O] = copPlan.stats.StatsVersion
+	case *PhysicalTableScan:
+		statsInfos[copPlan.Table.Name.O] = copPlan.stats.StatsVersion
+	}
+
+	return statsInfos
 }

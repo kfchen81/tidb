@@ -14,6 +14,9 @@
 package core
 
 import (
+	"context"
+
+	"github.com/cznic/mathutil"
 	"github.com/pingcap/tidb/expression"
 )
 
@@ -21,7 +24,7 @@ import (
 type pushDownTopNOptimizer struct {
 }
 
-func (s *pushDownTopNOptimizer) optimize(p LogicalPlan) (LogicalPlan, error) {
+func (s *pushDownTopNOptimizer) optimize(ctx context.Context, p LogicalPlan) (LogicalPlan, error) {
 	return p.pushDownTopN(nil), nil
 }
 
@@ -38,6 +41,18 @@ func (s *baseLogicalPlan) pushDownTopN(topN *LogicalTopN) LogicalPlan {
 
 // setChild set p as topn's child.
 func (lt *LogicalTopN) setChild(p LogicalPlan) LogicalPlan {
+	// Remove this TopN if its child is a TableDual.
+	dual, isDual := p.(*LogicalTableDual)
+	if isDual {
+		numDualRows := uint64(dual.RowCount)
+		if numDualRows < lt.Offset {
+			dual.RowCount = 0
+			return dual
+		}
+		dual.RowCount = int(mathutil.MinUint64(numDualRows-lt.Offset, lt.Count))
+		return dual
+	}
+
 	if lt.isLimit() {
 		limit := LogicalLimit{
 			Count:  lt.Count,
@@ -96,6 +111,14 @@ func (p *LogicalProjection) pushDownTopN(topN *LogicalTopN) LogicalPlan {
 		for _, by := range topN.ByItems {
 			by.Expr = expression.ColumnSubstitute(by.Expr, p.schema, p.Exprs)
 		}
+
+		// remove meaningless constant sort items.
+		for i := len(topN.ByItems) - 1; i >= 0; i-- {
+			switch topN.ByItems[i].Expr.(type) {
+			case *expression.Constant, *expression.CorrelatedColumn:
+				topN.ByItems = append(topN.ByItems[:i], topN.ByItems[i+1:]...)
+			}
+		}
 	}
 	p.children[0] = p.children[0].pushDownTopN(topN)
 	return p
@@ -143,4 +166,8 @@ func (p *LogicalJoin) pushDownTopN(topN *LogicalTopN) LogicalPlan {
 		return topN.setChild(p.self)
 	}
 	return p.self
+}
+
+func (*pushDownTopNOptimizer) name() string {
+	return "topn_push_down"
 }
